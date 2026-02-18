@@ -217,19 +217,25 @@ body{
   <div class="title-glow">NEON DEATH<br>PROTOCOL &nbsp;<span class="title-co">ONLINE</span></div>
   <div class="title-sub">// GLOBAL NEURAL-LINK COMBAT v3.0 //</div>
 
-  <!-- API Key -->
   <div class="setup-box">
-    <div class="setup-label">▸ ABLY API KEY（ably.com のダッシュボードからコピー）</div>
-    <input class="setup-input" id="api-key-input" type="password"
-           placeholder="xxxxxx.yyyyyy:zzzzzzzzzzzzzzzzzz" autocomplete="off" spellcheck="false">
-
     <!-- Room ID -->
-    <div class="setup-label" style="margin-top:6px">▸ ROOM ID（2人で同じ文字列を入力）</div>
+    <div class="setup-label">▸ ROOM ID（2人で同じ文字列を入力）</div>
     <div class="setup-row">
       <input class="setup-input" id="room-input" type="text"
              placeholder="例: room-alpha-7" autocomplete="off" spellcheck="false" maxlength="30">
       <button class="connect-btn" style="font-size:8px;padding:0 14px;letter-spacing:2px;animation:none" onclick="randomRoom()">ランダム</button>
     </div>
+
+    <!-- Password -->
+    <div class="setup-label" style="margin-top:6px">▸ ROOM PASSWORD（2人で同じパスワードを入力）</div>
+    <div class="setup-row" style="align-items:center;gap:8px">
+      <input class="setup-input" id="password-input" type="password"
+             placeholder="パスワードを入力..." autocomplete="off" spellcheck="false" maxlength="40"
+             style="flex:1">
+      <button class="connect-btn" style="font-size:8px;padding:0 10px;letter-spacing:1px;animation:none;white-space:nowrap"
+              onclick="togglePwVisible()">表示</button>
+    </div>
+    <div class="setup-label" id="pw-strength" style="min-height:10px"></div>
 
     <!-- Role -->
     <div class="setup-label" style="margin-top:6px">▸ ロール選択</div>
@@ -243,14 +249,15 @@ body{
     </div>
   </div>
 
-  <div class="status-line status-waiting" id="status-line">▶ API キーとルームIDを入力してロールを選択</div>
+  <div class="status-line status-waiting" id="status-line">▶ ルームID・パスワード・ロールを入力</div>
 
   <button class="connect-btn" id="connect-btn" onclick="connectAbly()" disabled>JACK IN</button>
   <button class="connect-btn" id="start-btn" onclick="beginGame()" style="display:none">▶ ゲーム開始</button>
   <button class="solo-btn" id="solo-btn" style="display:none" onclick="startSolo()">ソロで開始（P2待機のまま）</button>
 
   <div class="setup-hint">
-    <span>同じルームID</span>を使って別PCのブラウザから接続 — インターネット越しに動作します<br>
+    <span>同じルームID＋パスワード</span>を使って別PCから接続<br>
+    パスワードが違うと別の部屋になります（不正入室防止）<br>
     <span class="pc">P1:</span> マウス移動 &nbsp;|&nbsp; <span>[クリック/Space]</span> 発射 &nbsp;|&nbsp; <span>[Z]</span> ボム<br>
     <span class="p2c">P2:</span> マウス移動 &nbsp;|&nbsp; <span>[クリック/Space]</span> 発射 &nbsp;|&nbsp; <span>[X]</span> ボム
   </div>
@@ -322,15 +329,53 @@ body{
 <script>
 'use strict';
 // ================================================================
-//  ABLY LAYER  —  replaces BroadcastChannel entirely
+//  ABLY LAYER
 // ================================================================
 let ablyClient = null;
 let gameChannel = null;
-let myRole = 0;           // 1 or 2, chosen before connecting
+let myRole = 0;
 let p2Connected = false;
 let isSolo = false;
 let pingMs = 0;
 let pingInterval = null;
+
+// ---- HARDCODED API KEY ----
+const ABLY_API_KEY = 'CHjn_Q.hdLw3Q:_IFXXx1ZpCoQu14T2VUFH-YE4XLR4-8FBqXiKlabbI8';
+
+// ---- PASSWORD HASHING ----
+// Uses Web Crypto to derive a short hash from roomId+password
+// so the actual password never leaves the device
+async function deriveChannelName(roomId, password) {
+  const raw = `ndp:${roomId}:${password}`;
+  const buf = await crypto.subtle.digest('SHA-256',
+    new TextEncoder().encode(raw));
+  const hex = Array.from(new Uint8Array(buf))
+    .map(b => b.toString(16).padStart(2,'0')).join('');
+  return `ndp-${hex.slice(0,24)}`; // 24-char unique channel
+}
+
+// ---- PASSWORD STRENGTH INDICATOR ----
+function updatePwStrength() {
+  const pw = document.getElementById('password-input').value;
+  const el = document.getElementById('pw-strength');
+  if (!pw) { el.textContent=''; return; }
+  let strength = 0;
+  if (pw.length >= 6)  strength++;
+  if (pw.length >= 10) strength++;
+  if (/[A-Z]/.test(pw)) strength++;
+  if (/[0-9]/.test(pw)) strength++;
+  if (/[^a-zA-Z0-9]/.test(pw)) strength++;
+  const labels = ['','WEAK','FAIR','GOOD','STRONG','VERY STRONG'];
+  const colors = ['','#ff4444','#ff8800','#ffee00','#88ff00','#00ff88'];
+  el.textContent = '強度: ' + (labels[strength]||'');
+  el.style.color = colors[strength]||'#555';
+  checkReadyToConnect();
+}
+
+function togglePwVisible() {
+  const el = document.getElementById('password-input');
+  el.type = el.type === 'password' ? 'text' : 'password';
+}
 
 // Setup UI helpers
 function selectRole(r) {
@@ -349,25 +394,33 @@ function randomRoom() {
 }
 
 function checkReadyToConnect() {
-  const hasKey  = document.getElementById('api-key-input').value.trim().length > 10;
   const hasRoom = document.getElementById('room-input').value.trim().length > 0;
+  const hasPw   = document.getElementById('password-input').value.length > 0;
   const hasRole = myRole > 0;
-  document.getElementById('connect-btn').disabled = !(hasKey && hasRoom && hasRole);
+  document.getElementById('connect-btn').disabled = !(hasRoom && hasPw && hasRole);
 }
-document.getElementById('api-key-input').addEventListener('input', checkReadyToConnect);
 document.getElementById('room-input').addEventListener('input', checkReadyToConnect);
+document.getElementById('password-input').addEventListener('input', updatePwStrength);
 
 // ---- CONNECT ----
 async function connectAbly() {
-  const apiKey  = document.getElementById('api-key-input').value.trim();
-  const roomId  = document.getElementById('room-input').value.trim().replace(/\s+/g,'-');
-  if (!apiKey || !roomId || !myRole) return;
+  const roomId   = document.getElementById('room-input').value.trim().replace(/\s+/g,'-');
+  const password = document.getElementById('password-input').value;
+  if (!roomId || !password || !myRole) return;
 
-  setStatus('⟳ ABLY に接続中...', 'waiting');
+  setStatus('⟳ セキュアチャンネルを生成中...', 'waiting');
   document.getElementById('connect-btn').disabled = true;
 
+  // Derive unique channel name from room+password hash
+  const channelName = await deriveChannelName(roomId, password);
+
+  setStatus('⟳ ABLY に接続中...', 'waiting');
+
   try {
-    ablyClient = new Ably.Realtime({ key: apiKey, clientId: `player${myRole}-${Date.now()}` });
+    ablyClient = new Ably.Realtime({
+      key: ABLY_API_KEY,
+      clientId: `player${myRole}-${Date.now()}`
+    });
 
     await new Promise((res, rej) => {
       ablyClient.connection.once('connected', res);
@@ -375,15 +428,13 @@ async function connectAbly() {
       setTimeout(() => rej(new Error('timeout')), 8000);
     });
 
-    gameChannel = ablyClient.channels.get(`ndp-online-${roomId}`);
+    gameChannel = ablyClient.channels.get(channelName);
     await gameChannel.subscribe(handleAblyMsg);
 
-    // Presence: announce self
     await gameChannel.presence.enter({ role: myRole });
     gameChannel.presence.subscribe('enter', onPresenceEnter);
     gameChannel.presence.subscribe('leave', onPresenceLeave);
 
-    // Check if partner already present
     const members = await gameChannel.presence.get();
     const partner = members.find(m => m.data && m.data.role !== myRole);
     if (partner) {
@@ -397,13 +448,12 @@ async function connectAbly() {
 
     send('hello', { role: myRole });
 
-    // Ping every 3s
     pingInterval = setInterval(() => {
       if (p2Connected) send('ping', { t: Date.now() });
     }, 3000);
 
   } catch (err) {
-    setStatus('✗ 接続失敗: ' + (err.message||'APIキーを確認してください'), 'err');
+    setStatus('✗ 接続失敗: ' + (err.message||'しばらく待って再試行してください'), 'err');
     document.getElementById('connect-btn').disabled = false;
     if (ablyClient) { ablyClient.close(); ablyClient = null; }
   }
@@ -773,7 +823,9 @@ function beginGame() {
   loadStage(1);
   state = 'playing';
   updateConnDot();
-  requestAnimationFrame(loop);
+
+  // Start loop only once
+  if(!loopRunning){ loopRunning=true; requestAnimationFrame(loop); }
 
   // P1 tells P2 to start
   if (myRole === 1) send('start');
@@ -1276,14 +1328,25 @@ function broadcastStateSync(){
 }
 
 function applyStateSync(d){
-  enemies=d.enemies.map(e=>({...e,shootTimer:0,phaseTimer:e.phaseTimer||0}));
-  eBullets=d.eBullets.map(b=>({...b,alive:true}));
-  if(d.bossActive!==undefined) bossActive=d.bossActive;
-  if(d.gameTime!==undefined&&Math.abs(d.gameTime-gameTime)>60) gameTime=d.gameTime;
-  score=d.score; synergy=d.synergy;
-  if(d.combo!==undefined){ combo=d.combo; comboTimer=Math.max(comboTimer,60); }
-  powerups=d.powerups||[];
-  if(d.stage&&d.stage!==stage) loadStage(d.stage);
+  // Update enemies and bullets from authoritative P1 state
+  if(d.enemies) enemies = d.enemies.map(e=>({...e, shootTimer:0, phaseTimer:e.phaseTimer||0}));
+  if(d.eBullets) eBullets = d.eBullets.map(b=>({...b, alive:true}));
+  if(d.bossActive !== undefined) bossActive = d.bossActive;
+  if(d.gameTime !== undefined && Math.abs(d.gameTime-gameTime) > 60) gameTime = d.gameTime;
+  if(d.score !== undefined) score = d.score;
+  if(d.synergy !== undefined) synergy = d.synergy;
+  if(d.combo !== undefined){ combo = d.combo; comboTimer = Math.max(comboTimer, 60); }
+  if(d.powerups) powerups = d.powerups;
+
+  // Stage changed: update HUD only — do NOT call loadStage() as it resets enemies/bullets
+  if(d.stage && d.stage !== stage){
+    stage = d.stage;
+    gameTime = 0;
+    document.getElementById('stage-hud-label').textContent = `STAGE ${stage}`;
+    document.getElementById('stage-label-bot').textContent = `STAGE ${stage}`;
+    addNotice(`STAGE ${stage}`, '#00ffff');
+    setTimeout(()=>startBGM(), 800);
+  }
 }
 
 // ================================================================
@@ -1646,43 +1709,55 @@ document.getElementById('ov-btn').addEventListener('click',()=>{
   document.getElementById('conn-status').style.display='none';
   document.getElementById('setup').style.display='flex';
   p2Connected=false; isSolo=false;
-  setStatus('▶ API キーとルームIDを入力してロールを選択','waiting');
+  setStatus('▶ ルームID・パスワード・ロールを入力','waiting');
   document.getElementById('solo-btn').style.display='none';
+  document.getElementById('pw-strength').textContent='';
   checkReadyToConnect();
 });
 
 // ================================================================
 //  MAIN LOOP
 // ================================================================
+let loopRunning = false;
+
 function loop(){
-  if(state!=='playing'){ requestAnimationFrame(loop); return; }
-  frameN++; gameTime++;
-  if(myRole===1||isSolo) stageSpawn();
-  updateLocalPlayer();
-  if(myRole===1||isSolo) updateEnemies();
-  updateBullets();
-  if(myRole===1||isSolo) checkCollisions();
-  else {
-    if(localPlayer.invincible<=0){
-      for(const b of eBullets){
-        if(!b.alive) continue;
-        const dx=b.x-localPlayer.x,dy=b.y-localPlayer.y;
-        if(dx*dx+dy*dy<(localPlayer.size+b.size)*(localPlayer.size+b.size)){ b.alive=false; hitLocalPlayer(); }
-      }
-      eBullets=eBullets.filter(b=>b.alive);
-    }
-  }
-  updatePowerups();
-  updateParticles();
-  updateHUDDisplay();
-  draw();
+  // Always reschedule first so errors never stop the loop
   requestAnimationFrame(loop);
+
+  if(state!=='playing') return;
+
+  try {
+    frameN++; gameTime++;
+    if(myRole===1||isSolo) stageSpawn();
+    updateLocalPlayer();
+    if(myRole===1||isSolo) updateEnemies();
+    updateBullets();
+    if(myRole===1||isSolo) checkCollisions();
+    else {
+      if(localPlayer.invincible<=0){
+        for(const b of eBullets){
+          if(!b.alive) continue;
+          const dx=b.x-localPlayer.x,dy=b.y-localPlayer.y;
+          if(dx*dx+dy*dy<(localPlayer.size+b.size)*(localPlayer.size+b.size)){ b.alive=false; hitLocalPlayer(); }
+        }
+        eBullets=eBullets.filter(b=>b.alive);
+      }
+    }
+    updatePowerups();
+    updateParticles();
+    updateHUDDisplay();
+    draw();
+  } catch(err) {
+    console.error('Loop error:', err);
+  }
 }
 
 // ================================================================
 //  BOOT
 // ================================================================
 initStarfield();
+loopRunning = true;
+requestAnimationFrame(loop); // Loop runs always; only processes when state==='playing'
 window.addEventListener('beforeunload',()=>{ if(ablyClient) ablyClient.close(); });
 
 // ================================================================
